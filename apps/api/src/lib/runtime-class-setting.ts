@@ -57,16 +57,44 @@ export function dockerClassBlockedMessage(techStackId: string | null | undefined
   return 'Docker projects are not available on this server yet.'
 }
 
-/** Load the persisted override from `platform_settings` into memory. Call once at boot. */
+const DEFAULT_REFRESH_INTERVAL_MS = 30_000
+let refreshTimer: ReturnType<typeof setInterval> | null = null
+
+/**
+ * Sync the in-memory override with `platform_settings`. Safe to call repeatedly.
+ *
+ * A missing row resets the override to null, so clearing the setting (`PUT`
+ * with `enabled: null`) takes effect everywhere and falls back to the env var.
+ * On a read error the last known value is kept rather than flipping the gate.
+ */
 export async function loadDockerClassOverride(): Promise<void> {
   try {
     const { prisma } = await import('./prisma')
     const row = await prisma.platformSetting.findUnique({ where: { key: DOCKER_CLASS_SETTING_KEY } })
-    if (row) {
-      dockerClassOverride = row.value === 'true'
-      console.log(`[RuntimeClass] Loaded docker-class admin override: ${dockerClassOverride}`)
+    const next = row ? row.value === 'true' : null
+    if (next !== dockerClassOverride) {
+      dockerClassOverride = next
+      console.log(`[RuntimeClass] docker-class admin override is now: ${next}`)
     }
   } catch (err: any) {
-    console.log('[RuntimeClass] No docker-class override loaded (non-fatal):', err.message)
+    console.log('[RuntimeClass] docker-class override refresh failed (keeping last value):', err.message)
   }
+}
+
+/**
+ * Re-sync from the DB on an interval so every API instance converges on the
+ * value written by `PUT /api/admin/settings/docker-class`, not only the
+ * instance that handled the write. Idempotent.
+ */
+export function startDockerClassOverrideRefresh(intervalMs: number = DEFAULT_REFRESH_INTERVAL_MS): void {
+  if (refreshTimer) return
+  refreshTimer = setInterval(() => {
+    void loadDockerClassOverride()
+  }, intervalMs)
+  refreshTimer.unref?.()
+}
+
+export function stopDockerClassOverrideRefresh(): void {
+  if (refreshTimer) clearInterval(refreshTimer)
+  refreshTimer = null
 }

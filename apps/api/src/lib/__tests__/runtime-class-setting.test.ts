@@ -11,12 +11,15 @@
 import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test'
 
 let storedRow: { key: string; value: string } | null = null
+let readError: Error | null = null
 
 mock.module('../prisma', () => ({
   prisma: {
     platformSetting: {
-      findUnique: async ({ where: { key } }: { where: { key: string } }) =>
-        storedRow && storedRow.key === key ? storedRow : null,
+      findUnique: async ({ where: { key } }: { where: { key: string } }) => {
+        if (readError) throw readError
+        return storedRow && storedRow.key === key ? storedRow : null
+      },
     },
   },
 }))
@@ -26,6 +29,8 @@ const {
   getDockerClassOverride,
   setDockerClassOverride,
   loadDockerClassOverride,
+  startDockerClassOverrideRefresh,
+  stopDockerClassOverrideRefresh,
   isDockerClassEnabled,
 } = await import('../runtime-class-setting')
 
@@ -34,6 +39,8 @@ let prevEnv: string | undefined
 
 beforeEach(() => {
   storedRow = null
+  readError = null
+  stopDockerClassOverrideRefresh()
   setDockerClassOverride(null)
   prevEnv = process.env[ENV_KEY]
   delete process.env[ENV_KEY]
@@ -74,6 +81,46 @@ describe('runtime-class-setting', () => {
     storedRow = null
     await loadDockerClassOverride()
     expect(getDockerClassOverride()).toBeNull()
+  })
+
+  test('loadDockerClassOverride clears a stale in-memory value when the row was deleted', async () => {
+    // Another instance cleared the setting (PUT enabled: null) — this one must follow.
+    setDockerClassOverride(true)
+    storedRow = null
+    await loadDockerClassOverride()
+    expect(getDockerClassOverride()).toBeNull()
+  })
+
+  test('loadDockerClassOverride keeps the last known value when the DB read fails', async () => {
+    setDockerClassOverride(true)
+    readError = new Error('db unavailable')
+    await loadDockerClassOverride()
+    expect(getDockerClassOverride()).toBe(true)
+  })
+
+  test('startDockerClassOverrideRefresh picks up DB changes made after boot', async () => {
+    storedRow = { key: DOCKER_CLASS_SETTING_KEY, value: 'true' }
+    startDockerClassOverrideRefresh(10)
+    await new Promise((r) => setTimeout(r, 60))
+    expect(getDockerClassOverride()).toBe(true)
+
+    storedRow = { key: DOCKER_CLASS_SETTING_KEY, value: 'false' }
+    await new Promise((r) => setTimeout(r, 60))
+    expect(getDockerClassOverride()).toBe(false)
+
+    storedRow = null
+    await new Promise((r) => setTimeout(r, 60))
+    expect(getDockerClassOverride()).toBeNull()
+    stopDockerClassOverrideRefresh()
+  })
+
+  test('startDockerClassOverrideRefresh is idempotent', () => {
+    startDockerClassOverrideRefresh(1_000)
+    startDockerClassOverrideRefresh(1_000)
+    stopDockerClassOverrideRefresh()
+    // A single stop fully clears the timer; a second start should work again.
+    startDockerClassOverrideRefresh(1_000)
+    stopDockerClassOverrideRefresh()
   })
 
   describe('isDockerClassEnabled', () => {
