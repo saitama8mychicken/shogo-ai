@@ -50,6 +50,7 @@ import {
   postMessage,
   removeMember,
   requirePost,
+  normalizeLinkPreviewOptOuts,
   serializeConversation,
   setAttachmentUrlBuilder,
   setReaction,
@@ -611,6 +612,7 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
     const body = await readJson(c)
     try {
       const threadRootId = typeof body.threadRootId === 'string' ? body.threadRootId : null
+      const linkPreviewsOff = normalizeLinkPreviewOptOuts(body.linkPreviewsOff)
       const access = await requirePost(c.req.param('conversationId'), userId, { threadReply: !!threadRootId })
       if (!access.membership && (access.conversation.kind === 'public' || access.conversation.kind === 'activity')) {
         await joinConversation(access.conversation.id, userId)
@@ -624,6 +626,10 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
         alsoSentToChannel: body.alsoSentToChannel === true && access.conversation.kind !== 'activity',
         clientMsgId: typeof body.clientMsgId === 'string' ? body.clientMsgId.slice(0, 100) : null,
         attachmentIds: Array.isArray(body.attachmentIds) ? body.attachmentIds : [],
+        // The sender declined a preview for some of this message's links (they
+        // point into a closed conversation). Storing the refusal — never the
+        // preview — is what keeps the decision, and only the decision, here.
+        blocks: linkPreviewsOff.length ? { linkPreviewsOff } : undefined,
       })
       void afterMessagePosted(result, { actorUserId: userId, origin: 'app' })
       return c.json({ message: result.message }, result.duplicate ? 200 : 201)
@@ -878,6 +884,66 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
       const log = await loadWorkLog(row)
       if (!log) return c.json({ error: { code: 'not_found', message: 'No work log for this message' } }, 404)
       return c.json(log)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  // ─── Files (viewer) ──────────────────────────────────────────────────────
+  //
+  // The file viewer asks what a file is before it renders anything, and asks
+  // for its text when the file is one it can show. Both go through the same
+  // visibility rules as the Files list instead of trusting the capability URL,
+  // so a file from a deleted message, another workspace, or a channel the
+  // reader isn't in is a plain 404 — an id can't be probed by watching which
+  // error comes back. Neither route ever redirects: the S3 redirect on the
+  // capability URL is for downloading, and a viewer must not land in a tab.
+
+  router.get('/conversation-files/:attachmentId/meta', async (c) => {
+    const userId = await requireUser(c)
+    if (userId instanceof Response) return userId
+    try {
+      const principal: FilePrincipal = { kind: 'user', userId }
+      const { attachment, conversation } = await loadVisibleFile(principal, null, c.req.param('attachmentId'))
+      return c.json({
+        file: {
+          id: attachment.id,
+          conversationId: attachment.conversationId,
+          messageId: attachment.messageId,
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          size: attachment.size,
+          width: attachment.width ?? null,
+          height: attachment.height ?? null,
+          durationMs: attachment.durationMs ?? null,
+          peaks: attachment.peaks ?? null,
+          preview: publicPreview(attachment.previewData),
+          createdAt: attachment.createdAt,
+          url: conversationFileUrl(attachment),
+          // Text the server already holds, or could produce on demand — the
+          // viewer only asks the text route for a file it can actually read.
+          hasText:
+            !!attachment.extractedText ||
+            canExtract(attachment.mimeType, attachment.name, attachment.size),
+        },
+        conversation: { id: conversation.id, name: conversation.name ?? null, kind: conversation.kind },
+      })
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  })
+
+  router.get('/conversation-files/:attachmentId/text', async (c) => {
+    const userId = await requireUser(c)
+    if (userId instanceof Response) return userId
+    try {
+      const principal: FilePrincipal = { kind: 'user', userId }
+      const { conversation } = await loadVisibleFile(principal, null, c.req.param('attachmentId'))
+      const text = await readFileText(principal, conversation.workspaceId, c.req.param('attachmentId'), {
+        offset: numberParam(c.req.query('offset')),
+        limit: numberParam(c.req.query('limit')),
+      })
+      return c.json(text)
     } catch (err) {
       return errorResponse(c, err)
     }

@@ -61,6 +61,29 @@ export function projectScopedId(projectId: string | null | undefined): string | 
 }
 
 /**
+ * True when `projectId` is one of the projects this process actually serves.
+ *
+ * A runtime is told which project(s) it serves by `PROJECT_ID` /
+ * `WORKSPACE_ANCHOR_PROJECT_ID`. When those are set and name something else —
+ * a test fixture, or a `projectId` left over from another process — a
+ * project-scoped internal call would pull a stranger's settings into this
+ * runtime's `config.json`. With neither env id set there is nothing to compare
+ * against, so the call is allowed (unchanged behaviour for callers that pass an
+ * explicit id).
+ */
+export function runtimeServesProjectId(
+  projectId: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const scoped = projectScopedId(projectId)
+  if (!scoped) return false
+  const served = [projectScopedId(env.PROJECT_ID), projectScopedId(env.WORKSPACE_ANCHOR_PROJECT_ID)]
+    .filter((id): id is string => !!id)
+  if (served.length === 0) return true
+  return served.includes(scoped)
+}
+
+/**
  * True when this process can authenticate an `/api/internal` call.
  * Tests and unassigned processes have neither, and calling the API would
  * only burn a timeout before failing.
@@ -1991,6 +2014,15 @@ export interface ProjectConfigSnapshot {
   workingMode: string
   settings: unknown
   slackEnabled: boolean
+  /**
+   * The project's most-called tools over the last 30 days (SHO-97), used to
+   * learn which tool definitions to keep advertised. Additive — older APIs omit
+   * it and the runtime falls back to its static ranking.
+   */
+  toolUsage?: {
+    totalCalls: number
+    tools: Array<{ name: string; calls: number }>
+  }
   agent: {
     heartbeatEnabled: boolean
     heartbeatInterval: number
@@ -2020,6 +2052,23 @@ export async function getProjectConfig(
   })
 }
 
+/**
+ * The project's most-called tools over the last 30 days, for the advertised
+ * tool set (SHO-97). Null when the API does not report it.
+ */
+export async function getProjectToolUsage(
+  projectId: string,
+  timeoutMs = 3_000,
+): Promise<{ order: string[]; totalCalls: number } | null> {
+  const res = await getProjectConfig(projectId, timeoutMs)
+  const usage = res.ok ? res.data?.toolUsage : undefined
+  if (!usage || !Array.isArray(usage.tools)) return null
+  return {
+    totalCalls: usage.totalCalls ?? 0,
+    order: usage.tools.map((t) => t.name).filter((n): n is string => typeof n === 'string'),
+  }
+}
+
 export async function configureProject(
   projectId: string,
   patch: ProjectConfigPatch,
@@ -2028,6 +2077,44 @@ export async function configureProject(
     method: 'PATCH',
     body: JSON.stringify(patch),
     parse: (j) => j?.project as ProjectConfigSnapshot,
+  })
+}
+
+/**
+ * The workspace agent's own settings (`Workspace.settings`), not a project's.
+ * A workspace runtime serves both surfaces, so its capability toggles live
+ * here while a project chat keeps `Project.settings`.
+ */
+export interface WorkspaceConfigSnapshot {
+  id: string
+  name: string
+  kind: string
+  settings: unknown
+}
+
+export interface WorkspaceConfigPatch {
+  settings?: Record<string, unknown>
+}
+
+export async function getWorkspaceConfig(
+  workspaceId: string,
+  timeoutMs?: number,
+): Promise<CheckpointCallResult<WorkspaceConfigSnapshot>> {
+  return lifecycleFetch(`/api/internal/workspaces/${encodeURIComponent(workspaceId)}/config`, {
+    method: 'GET',
+    timeoutMs,
+    parse: (j) => j?.workspace as WorkspaceConfigSnapshot,
+  })
+}
+
+export async function configureWorkspace(
+  workspaceId: string,
+  patch: WorkspaceConfigPatch,
+): Promise<CheckpointCallResult<WorkspaceConfigSnapshot>> {
+  return lifecycleFetch(`/api/internal/workspaces/${encodeURIComponent(workspaceId)}/config`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+    parse: (j) => j?.workspace as WorkspaceConfigSnapshot,
   })
 }
 
@@ -2257,8 +2344,37 @@ export async function consumeBackgroundTasks(ids: string[]): Promise<CheckpointC
   })
 }
 
-export async function listBackgroundTasks(chatSessionId: string): Promise<CheckpointCallResult<{ tasks: BackgroundTaskState[] }>> {
+/** One undelivered background update a paused session is holding. */
+export interface WakingTask {
+  taskId: string
+  source: string
+  title: string
+  finishedAt: string | null
+}
+
+/**
+ * What a session is waiting to be told. `paused` means it woke itself too many
+ * times in a row and is waiting for a person; `waiting` is what the queued
+ * wakes are for.
+ */
+export interface SessionWakeState {
+  paused: boolean
+  wakesInARow: number
+  limit: number
+  waiting: WakingTask[]
+}
+
+export async function listBackgroundTasks(
+  chatSessionId: string,
+): Promise<CheckpointCallResult<{ tasks: BackgroundTaskState[]; wake?: SessionWakeState }>> {
   return lifecycleFetch(`${tasksPath}?chatSessionId=${encodeURIComponent(chatSessionId)}`, { method: 'GET', timeoutMs: 10_000 })
+}
+
+/** The session's wake state on its own; used at turn start to tell the agent what is waiting. */
+export async function getSessionWakeState(chatSessionId: string): Promise<SessionWakeState | null> {
+  const res = await listBackgroundTasks(chatSessionId).catch(() => null)
+  if (!res?.ok) return null
+  return res.data?.wake ?? null
 }
 
 /** Hand finished local tasks to the API so it wakes the (idle) session with one queued message. */

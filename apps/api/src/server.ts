@@ -35,7 +35,7 @@ import { workBoardRoutes } from './routes/work-boards'
 // local mode too. Loading them via server-cloud-deps left local 404ing.
 import { scopedAnalyticsRoutes } from './routes/scoped-analytics'
 import { costAnalyticsRoutes } from './routes/cost-analytics'
-import { AGENT_REPLY_TIMEOUT_MS, configureConversationAgentDispatcher, settleOrphanedAgentReplies } from './services/conversation-agent-dispatcher'
+import { configureConversationAgentDispatcher, settleOrphanedAgentReplies } from './services/conversation-agent-dispatcher'
 import { registerBuiltInChatProviders } from './services/chat-providers'
 import { chatProviderRoutes } from './routes/chat-providers'
 import { conversationSocketHandlers, isConversationSocketData } from './realtime/conversation-socket'
@@ -46,6 +46,7 @@ import { startEventDeliveryWorker, stopEventDeliveryWorker } from './jobs/run-ev
 import { inviteLinkAcceptRoutes } from './routes/invite-link-accept'
 import { createInviteLinkAfterAccept } from './routes/invite-link-after-accept'
 import { inviteLinkRoutes } from './routes/invite-links'
+import { invitationInfoRoutes } from './routes/invitation-info'
 import { rbacRoutes } from './routes/rbac'
 import { appActionsRoutes } from './routes/app-actions'
 import { startChatQueueWorker, stopChatQueueWorker } from './jobs/run-chat-queue-drain'
@@ -1151,7 +1152,6 @@ if (process.env.SHOGO_LOCAL_MODE === 'true') {
     { id: 'openai',     envKey: 'OPENAI_API_KEY' },
     { id: 'google',     envKey: 'GOOGLE_API_KEY' },
     { id: 'openrouter', envKey: 'OPENROUTER_API_KEY' },
-    { id: 'fal',        envKey: 'FAL_KEY' },
     { id: 'tripo',      envKey: 'TRIPO_API_KEY' },
     { id: 'higgsfield', envKey: 'HIGGSFIELD_API_KEY' },
   ] as const
@@ -1618,8 +1618,9 @@ app.route('/api', workspaceMeetingRoutes({ authorize: sessionAuthorize(getAuthUs
 app.route('/api', sharedMeetingRoutes())
 // Workspace channels (team chat with @mentionable agents).
 configureConversationAgentDispatcher({ runtimeManager: getRuntimeManager() })
-// Other pods may still be writing replies; only settle those past the longest a run can take.
-void settleOrphanedAgentReplies(AGENT_REPLY_TIMEOUT_MS + 60_000).catch((err) => console.warn('[Channels] could not settle interrupted replies:', err?.message ?? err))
+// A reply another pod is still writing keeps its turn heartbeated, so the
+// heartbeat — not a fixed age — is what tells a dead run from a live one.
+void settleOrphanedAgentReplies(0).catch((err) => console.warn('[Channels] could not settle interrupted replies:', err?.message ?? err))
 registerBuiltInChatProviders()
 app.route('/api', conversationRoutes({ resolveUserId: getAuthUserId }))
 app.route('/api', workBoardRoutes({ resolveUserId: getAuthUserId }))
@@ -5850,6 +5851,30 @@ app.post('/api/projects/:projectId/chat/stop', async (c) => {
   return router.fetch(newReq)
 })
 
+// POST /api/projects/:projectId/chat/compact - Summarize this chat's context now
+// (the context-usage dock's "Summarize now"). The inner router under
+// `projectChatRoutes` is only reachable through explicit forwarders, so this
+// registration is what makes the route exist at all.
+app.post('/api/projects/:projectId/chat/compact', async (c) => {
+  const authResult = await requireProjectAuth(c)
+  if ('error' in authResult) return authResult.error
+
+  // Region-pin: the session's history lives in the runtime that owns the turn.
+  const pinned = await pinChatToHomeRegion(c, authResult.projectId)
+  if (pinned) return pinned
+
+  const manager = getRuntimeManager()
+  const router = projectChatRoutes({ runtimeManager: manager })
+  const url = new URL(c.req.url)
+  url.pathname = `/projects/${c.req.param('projectId')}/chat/compact`
+  const newReq = new Request(url.toString(), {
+    method: 'POST',
+    headers: c.req.raw.headers,
+    body: c.req.raw.body,
+  })
+  return router.fetch(newReq)
+})
+
 // POST /api/projects/:projectId/chat/wake - Wake up a scaled-to-zero pod
 app.post('/api/projects/:projectId/chat/wake', async (c) => {
   const authResult = await requireProjectAuth(c)
@@ -9011,6 +9036,13 @@ app.get('/api/invite-links/:token/info', async (c) => {
     },
   })
 })
+
+// Get invitation info for the emailed accept link (`/invitations/<id>/accept`).
+// Public on purpose — the page renders before the invitee signs in — and the
+// payload carries no email address. Mounted BEFORE the generated routers so
+// `/:id/info` can't fall through to the generated `GET /:id` (which requires
+// an authenticated session and the invitation to belong to the caller).
+app.route('/api/invitations', invitationInfoRoutes())
 
 // Custom chat-message extension endpoints (truncate-from, etc.).
 // MUST be mounted BEFORE the generated routes so Hono matches the
