@@ -143,6 +143,14 @@ export interface AgentLoopOptions {
   /** Custom stream function (for testing — replaces Pi's streamSimple) */
   streamFn?: StreamFn
   /**
+   * Which registered tools are advertised to the provider on each API call.
+   * A tool that is not advertised stays callable — the loop dispatches it by
+   * name — but its schema is left out of the request. Read once per API call
+   * (not once per run), so a tool activated during a turn is advertised on the
+   * loop's next request.
+   */
+  isAdvertisedTool?: (tool: AgentTool) => boolean
+  /**
    * Time-to-first-token stall fallback. When the active model produces no
    * streamed content within the configured window, the in-flight request is
    * aborted and retried against a stronger fallback model for a cooldown window
@@ -265,6 +273,27 @@ export interface ToolCallRecord {
   output: any
 }
 
+/**
+ * Usage of a single model call inside one turn — one entry per assistant
+ * message, in call order. The turn's totals are the sum of these, so a
+ * cache-hit ratio can be computed per call instead of only per turn (a
+ * per-iteration cache rewrite used to be invisible: turn totals hide it).
+ */
+export interface PerCallUsage {
+  /** 1-based position of the assistant message in this turn's transcript; 0 for a dropped attempt. */
+  iteration: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  /**
+   * True for a call whose assistant message the retry ladder dropped after a
+   * failed/partial stream. The provider still billed it, so its usage is kept
+   * here (and in the turn totals) even though it never reaches the transcript.
+   */
+  discarded?: boolean
+}
+
 export interface AgentLoopResult {
   text: string
   toolCalls: ToolCallRecord[]
@@ -273,6 +302,8 @@ export interface AgentLoopResult {
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
+  /** Per-model-call breakdown of the token counts above. */
+  perCallUsage: PerCallUsage[]
   /** All new messages produced during this loop (user prompt + assistant + tool results) */
   newMessages: Message[]
   /** Set if the loop was terminated by the circuit breaker */
@@ -554,8 +585,11 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
       })
     }
   }
-  if (orchestrated.tools.some(isHiddenTool)) {
-    effectiveStreamFn = withoutHiddenTools(effectiveStreamFn ?? streamSimple)
+  // Legacy tools flagged `hidden`, plus the caller's advertised set (SHO-97),
+  // are stripped from every provider request. Hidden tools stay dispatchable.
+  const advertisedTool = options.isAdvertisedTool
+  if (orchestrated.tools.some(isHiddenTool) || advertisedTool) {
+    effectiveStreamFn = withoutUnadvertisedTools(effectiveStreamFn ?? streamSimple, advertisedTool)
   }
 
   const agent = new Agent({
@@ -1379,6 +1413,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     outputTokens: usage.output + discardedUsage.output,
     cacheReadTokens: usage.cacheRead + discardedUsage.cacheRead,
     cacheWriteTokens: usage.cacheWrite + discardedUsage.cacheWrite,
+    perCallUsage: collectPerCallUsage(newMessages, discardedUsage),
     newMessages,
     loopBreak,
     error: promptError || implicitError,
@@ -1423,6 +1458,38 @@ function extractPathHint(msg: Message): string | undefined {
     if (match) return match[1]
   }
   return undefined
+}
+
+/**
+ * One entry per model call: pi-agent-core appends one assistant message per
+ * request, so the assistant messages in this turn's slice ARE the calls. Entries
+ * with no tokens at all are skipped (the synthetic max-turns notice, mocked
+ * turns), and a dropped retry attempt is appended once with `discarded: true`
+ * so the sum of `perCallUsage` always equals the turn's reported totals.
+ */
+function collectPerCallUsage(
+  messages: ReadonlyArray<Message>,
+  discarded: { input: number; output: number; cacheRead: number; cacheWrite: number },
+): PerCallUsage[] {
+  const out: PerCallUsage[] = []
+  let call = 0
+  for (const msg of messages) {
+    if (msg.role !== 'assistant') continue
+    call++
+    const entry: PerCallUsage = {
+      iteration: call,
+      input: msg.usage.input,
+      output: msg.usage.output,
+      cacheRead: msg.usage.cacheRead ?? 0,
+      cacheWrite: msg.usage.cacheWrite ?? 0,
+    }
+    if (entry.input + entry.output + entry.cacheRead + entry.cacheWrite === 0) continue
+    out.push(entry)
+  }
+  if (discarded.input + discarded.output + discarded.cacheRead + discarded.cacheWrite > 0) {
+    out.push({ iteration: 0, ...discarded, discarded: true })
+  }
+  return out
 }
 
 function buildImageOmittedNote(opts: {
@@ -1595,7 +1662,24 @@ export function isHiddenTool(tool: AgentTool): boolean {
   return (tool as AgentTool & { hidden?: boolean }).hidden === true
 }
 
-function withoutHiddenTools(streamFn: StreamFn): StreamFn {
+/**
+ * Strip hidden tools and anything the caller's advertised set defers from every
+ * provider request. Evaluated per request, so activating a tool mid-turn takes
+ * effect on the loop's next API call.
+ */
+function withoutUnadvertisedTools(
+  streamFn: StreamFn,
+  isAdvertisedTool?: (tool: AgentTool) => boolean,
+): StreamFn {
   return (model, context, opts) =>
-    streamFn(model, { ...context, tools: context.tools?.filter((t) => !isHiddenTool(t as AgentTool)) }, opts)
+    streamFn(
+      model,
+      {
+        ...context,
+        tools: context.tools?.filter(
+          (t) => !isHiddenTool(t as AgentTool) && (isAdvertisedTool ? isAdvertisedTool(t as AgentTool) : true),
+        ),
+      },
+      opts,
+    )
 }
