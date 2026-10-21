@@ -217,7 +217,7 @@ export function conversationRoutes(config: ConversationRoutesConfig): Hono {
   })
 
   mountConversationExtras(router, { requireUser, requireWorkspace, errorResponse, readJson })
-  mountHuddleRoutes(router, { requireUser, requireWorkspace, errorResponse })
+  mountHuddleRoutes(router, { optionalUser: (c) => config.resolveUserId(c), requireUser, requireWorkspace, errorResponse })
 
   // ─── Workspace-level ─────────────────────────────────────────────────────
 

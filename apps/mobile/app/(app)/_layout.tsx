@@ -55,7 +55,7 @@ import { AppSidebar } from "../../components/layout/AppSidebar";
 import { TeamChatNotifier } from "../../components/team-chat/TeamChatNotifier";
 import { NotificationPermissionBanner } from "../../components/notifications/NotificationPermissionBanner";
 import { AgentGlancePublisher } from "../../components/layout/AgentGlancePublisher";
-import { HuddleDock } from "../../components/team-chat/HuddleDock";
+import { HuddleWindow } from "../../components/team-chat/HuddleWindow";
 import { HuddleRinger } from "../../components/team-chat/HuddleRinger";
 import { AppHeader } from "../../components/layout/AppHeader";
 import { RecordingIndicator } from "../../components/meetings/RecordingIndicator";
@@ -562,7 +562,7 @@ function AppLayoutInner() {
       {!isIdeEmbed ? <TeamChatNotifier /> : null}
       {!isIdeEmbed ? <NotificationPermissionBanner /> : null}
       {!isIdeEmbed ? <AgentGlancePublisher /> : null}
-      {!isIdeEmbed ? <HuddleDock /> : null}
+      {!isIdeEmbed ? <HuddleWindow /> : null}
       {!isIdeEmbed ? <HuddleRinger /> : null}
       {/* The shell stays mounted on every phone route and only toggles its
           chrome. Swapping the parent of <Slot /> between routes (e.g. the team

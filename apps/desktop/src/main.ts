@@ -72,6 +72,7 @@ import { registerLazyChannels } from './lazy-ipc'
 import { createTray, destroyTray } from './tray'
 import { WindowManager } from './window-manager'
 import { IslandWindow } from './island-window'
+import { HuddleHostWindow } from './huddle-window'
 import {
   openPreview,
   closePreview,
@@ -215,6 +216,7 @@ app.on('second-instance', () => {
 const IS_DEV = !app.isPackaged
 
 let islandWindow: IslandWindow | null = null
+let huddleHostWindow: HuddleHostWindow | null = null
 const windowManager = new WindowManager({
   onWindowClosed: (window) => {
     closeAllForWindow(window)
@@ -224,6 +226,8 @@ const windowManager = new WindowManager({
     if (!windowManager.hasWindows()) {
       islandWindow?.destroy()
       islandWindow = null
+      huddleHostWindow?.destroy()
+      huddleHostWindow = null
       app.quit()
     }
   },
@@ -2046,6 +2050,9 @@ app.whenReady().then(async () => {
         }),
   })
   recording.setMeetingPromptPresenter(() => islandWindow?.canPresentMeetingPrompt() ?? false)
+  huddleHostWindow = new HuddleHostWindow(windowManager, {
+    loadApp: (window) => loadAppWindow(window, '/huddle'),
+  })
 
   if (!isCloudMode) {
     createTray({
@@ -2125,6 +2132,8 @@ app.on('before-quit', (event) => {
   if (isQuitting) return
   islandWindow?.destroy()
   islandWindow = null
+  huddleHostWindow?.destroy()
+  huddleHostWindow = null
   if (isCloudMode) {
     disposeIdeIfLoaded()
     return
