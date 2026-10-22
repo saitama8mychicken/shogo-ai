@@ -510,6 +510,7 @@ export type TeamChatEvent =
       title: string
       body: string
     }
+  | { type: 'settings.changed'; settings: ChatSettings }
   | { type: 'status.changed'; userId: string; status: UserStatus | null }
   | { type: 'inbox.created'; item: InboxItem }
   | { type: 'inbox.read'; unread: number; unreadThreads?: number }
