@@ -41,6 +41,14 @@ export function playMessageSound(
   return false
 }
 
+export function claimMessageSound(_messageKey: string): Promise<boolean> {
+  return Promise.resolve(true)
+}
+
+export function messageSoundRecentlyPlayed(_now?: number): boolean {
+  return false
+}
+
 export function previewMessageSound(_level: MessageSoundLevel, _tone?: MessageTone): boolean {
   return false
 }

@@ -22,7 +22,10 @@ import { nativeChatVisible } from '../../lib/team-chat-api'
 import { isUserInactive, notifyChannelMessage, requestAttention } from '../../lib/notifications/chat-notifier'
 import { armPermissionNudge } from '../../lib/notifications/permission-nudge'
 import {
+  claimMessageSound,
   messageSoundKindFor,
+  messageSoundRecentlyPlayed,
+  notificationAudioReady,
   playMessageSound,
   setPreferredMessageTone,
   unlockNotificationAudio,
@@ -73,7 +76,18 @@ export function TeamChatNotifier() {
       armPermissionNudge(event.reason)
       // Plays whether or not banner permission is granted; the server already
       // skipped users in DND or quiet hours.
-      const played = playMessageSound(messageSoundKindFor(event.reason), messageSoundRef.current, messageToneRef.current)
+      const level = messageSoundRef.current
+      // With several tabs of this account open, one plays the cue and the rest stay quiet.
+      // A tab whose audio isn't running yet never takes the claim, so it can't swallow the cue.
+      const ownsCue =
+        level === 'off' || !event.messageId || !notificationAudioReady() ||
+        (await claimMessageSound(`${event.conversationId ?? 'inbox'}:${event.messageId}`))
+      // A second alert inside the throttle window plays no cue, but its banner stays
+      // silent too, so the system's default sound never lands on top of the chosen tone.
+      const played = ownsCue
+        ? playMessageSound(messageSoundKindFor(event.reason), level, messageToneRef.current) ||
+          (level !== 'off' && messageSoundRecentlyPlayed())
+        : true
       void requestAttention(event.reason)
       await notifyChannelMessage({
         // Reminders without a message have no conversation; `/c/inbox` is the inbox screen.

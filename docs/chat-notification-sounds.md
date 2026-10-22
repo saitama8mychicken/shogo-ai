@@ -29,6 +29,10 @@ On web and desktop, chat messages play the tone chosen under "Message tone" in S
 
 The message sounds and huddle sounds share one audio context. The browser only allows it to start after the first click or key press in the app. Until then, message sounds stay silent. The recording for the chosen tone is fetched and decoded on that first click or key press. If a message arrives before it has loaded, or if the file can't be loaded, the matching fallback cue plays instead.
 
+With several tabs of the same account open in one browser profile, only one tab plays the cue for a given message. The first tab with running audio takes a Web Lock for that message and the others stay quiet; a tab whose audio hasn't started never takes the lock. Separate browsers or apps can't share the lock, so each still plays its own cue. A second alert inside the throttle window plays no cue, and its OS banner is silent too, so the system's default sound never stacks on the chosen tone.
+
+Saving chat settings sends a `settings.changed` event to that person's other open tabs and devices, so a tone change applies everywhere right away instead of after a reload.
+
 ## Step 1: who gets a chat alert (server)
 
 Every alert starts on the server, in `apps/api/src/services/conversation-notifications.ts`. For each new message, the server picks the strongest reason for each member. The author is never alerted about their own message.
