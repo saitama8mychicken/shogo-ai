@@ -125,7 +125,6 @@ export function NewMessagePicker({
           <Pressable
             key={f.id}
             accessibilityRole="tab"
-            accessibilityState={{ selected: filter === f.id }}
             aria-selected={filter === f.id}
             onPress={() => setFilter(f.id)}
             className={cn('rounded-full px-3 py-1', filter === f.id ? 'bg-primary' : 'bg-muted active:bg-muted/70')}
@@ -167,7 +166,7 @@ export function NewMessagePicker({
                 <Pressable
                   key={p.id}
                   accessibilityRole="checkbox"
-                  accessibilityState={{ checked: on }}
+                  aria-checked={on}
                   accessibilityLabel={`${p.name}, ${p.email}`}
                   onPress={() => toggle(p.id)}
                   className="min-h-12 flex-row items-center gap-3 rounded-md px-2 py-2 active:bg-muted hover:bg-muted"
