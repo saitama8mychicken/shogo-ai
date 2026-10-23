@@ -2,7 +2,7 @@
 
 This document lists every audio notification in Shogo chat: what each sound is, and the conditions under which it plays on web, desktop, and phones.
 
-On web and desktop, chat messages play the tone chosen under "Message tone" in Chat preferences. The default is the Soft Knock recording (`apps/mobile/assets/sounds/soft-knock.mp3`, 2 seconds). The default huddle ring plays the Llamada Clara recording (`apps/mobile/assets/sounds/llamada-clara.mp3`, 18.5 seconds). All other in-app sounds are synthesized with Web Audio. Phones don't use these sounds. They rely on the system notification sound, vibration, or the system call screen.
+On web and desktop, chat messages play the tone chosen under "Message tone" in Settings > Chat. The default is the Soft Knock recording (`apps/mobile/assets/sounds/soft-knock.mp3`, 2 seconds). The default huddle ring plays the Llamada Clara recording (`apps/mobile/assets/sounds/llamada-clara.mp3`, 18.5 seconds). All other in-app sounds are synthesized with Web Audio. Phones don't use these sounds. They rely on the system notification sound, vibration, or the system call screen.
 
 ## Sound inventory
 
@@ -28,6 +28,10 @@ On web and desktop, chat messages play the tone chosen under "Message tone" in C
 | System call ringtone | Incoming direct call on a phone (CallKit or CallKeep) | The phone's ringtone | `apps/mobile/lib/native-call` |
 
 The message sounds and huddle sounds share one audio context. The browser only allows it to start after the first click or key press in the app. Until then, message sounds stay silent. The recording for the chosen tone is fetched and decoded on that first click or key press. If a message arrives before it has loaded, or if the file can't be loaded, the matching fallback cue plays instead.
+
+With several tabs of the same account open in one browser profile, only one tab plays the cue for a given message. The first tab with running audio takes a Web Lock for that message and the others stay quiet; a tab whose audio hasn't started never takes the lock. Separate browsers or apps can't share the lock, so each still plays its own cue. A second alert inside the throttle window plays no cue, and its OS banner is silent too, so the system's default sound never stacks on the chosen tone.
+
+Saving chat settings sends a `settings.changed` event to that person's other open tabs and devices, so a tone change applies everywhere right away instead of after a reload.
 
 ## Step 1: who gets a chat alert (server)
 

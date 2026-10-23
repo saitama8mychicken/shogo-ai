@@ -11,7 +11,9 @@ mock.module('../notification-sound-asset', () => ({
 import {
   MESSAGE_SOUND_THROTTLE_MS,
   _resetNotificationAudioForTests,
+  claimMessageSound,
   messageSoundKindFor,
+  messageSoundRecentlyPlayed,
   playMessageSound,
   previewMessageSound,
   setPreferredMessageTone,
@@ -185,6 +187,42 @@ describe('notification-sound: playMessageSound', () => {
     expect(playMessageSound('mention', 'default', 'knock', 10_000 + 200)).toBe(false)
     expect(playMessageSound('thread', 'default', 'knock', 10_000 + MESSAGE_SOUND_THROTTLE_MS - 1)).toBe(false)
     expect(playMessageSound('thread', 'default', 'knock', 10_000 + MESSAGE_SOUND_THROTTLE_MS)).toBe(true)
+  })
+
+  test('reports a cue as recent only inside the throttle window', () => {
+    unlockNotificationAudio()
+    expect(messageSoundRecentlyPlayed(10_000)).toBe(false)
+    fire('pointerdown')
+    expect(playMessageSound('dm', 'default', 'knock', 10_000)).toBe(true)
+    expect(messageSoundRecentlyPlayed(10_000 + 200)).toBe(true)
+    expect(messageSoundRecentlyPlayed(10_000 + MESSAGE_SOUND_THROTTLE_MS - 1)).toBe(true)
+    expect(messageSoundRecentlyPlayed(10_000 + MESSAGE_SOUND_THROTTLE_MS)).toBe(false)
+  })
+
+  test('only the first tab to claim a message plays its cue', async () => {
+    const held = new Set<string>()
+    const fakeLocks = {
+      request: (name: string, _opts: unknown, cb: (lock: object | null) => unknown) => {
+        if (held.has(name)) return Promise.resolve(cb(null))
+        held.add(name)
+        return Promise.resolve(cb({ name }))
+      },
+    }
+    const nav = globalThis as any
+    const original = Object.getOwnPropertyDescriptor(nav, 'navigator')
+    Object.defineProperty(nav, 'navigator', { value: { locks: fakeLocks }, configurable: true })
+    try {
+      expect(await claimMessageSound('c1:m1')).toBe(true)
+      expect(await claimMessageSound('c1:m1')).toBe(false)
+      expect(await claimMessageSound('c1:m2')).toBe(true)
+    } finally {
+      if (original) Object.defineProperty(nav, 'navigator', original)
+      else delete nav.navigator
+    }
+  })
+
+  test('a claim resolves true where Web Locks are missing, so a cue is never lost', async () => {
+    expect(await claimMessageSound('c1:m9')).toBe(true)
   })
 
   test('a refused cue does not start the throttle window', () => {

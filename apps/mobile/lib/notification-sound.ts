@@ -9,7 +9,7 @@
  * message sounds stay silent instead of queueing up. Phones use the system
  * push sound, so the native build uses `notification-sound.native.ts`.
  *
- * Messages play the tone the user picked in Chat preferences. Soft Knock
+ * Messages play the tone the user picked in Settings > Chat. Soft Knock
  * (`assets/sounds/soft-knock.mp3`) is the default; every tone except Chirp is
  * a recording, decoded once after the first gesture. Until it has loaded, or
  * where it can't be fetched or decoded, the synthesized Chirp cues below play.
@@ -207,6 +207,37 @@ export function playMessageSound(
   void loadTone(ctx, tone)
   scheduleTones(ctx, MESSAGE_TONES[kind], level === 'subtle' ? SUBTLE_PEAK : DEFAULT_PEAK)
   return true
+}
+
+/**
+ * Lets one tab per browser profile play the cue for a message. Every open tab
+ * of the same account gets the notification, and each would otherwise play its
+ * own cue, so a second tab doubled the sound. The first tab to ask holds a Web
+ * Lock for the message; the others get `false` and stay quiet. Resolves `true`
+ * where Web Locks are missing, so a cue is never lost to the check.
+ */
+export function claimMessageSound(messageKey: string): Promise<boolean> {
+  const locks = typeof navigator !== 'undefined' ? (navigator as Navigator & { locks?: LockManager }).locks : undefined
+  if (!locks?.request) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    locks
+      .request(`shogo-message-sound:${messageKey}`, { ifAvailable: true }, (lock) => {
+        resolve(!!lock)
+        // Hold the lock past the throttle window so a late tab can't claim the same message.
+        return lock ? new Promise<void>((release) => setTimeout(release, MESSAGE_SOUND_THROTTLE_MS)) : undefined
+      })
+      .catch(() => resolve(true))
+  })
+}
+
+/**
+ * True while a message cue is still within its throttle window. A second alert
+ * in that window plays no cue of its own, but its OS banner must stay silent
+ * too: the chosen tone just played, and the system's default alert sound on top
+ * of it would be a second, different sound.
+ */
+export function messageSoundRecentlyPlayed(now: number = Date.now()): boolean {
+  return now - lastMessageSoundAt < MESSAGE_SOUND_THROTTLE_MS
 }
 
 /**
