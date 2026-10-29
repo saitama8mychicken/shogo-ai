@@ -32,6 +32,7 @@ import {
   BackHandler,
   Keyboard,
   Alert,
+  AppState,
   useColorScheme,
 } from "react-native";
 import {
@@ -67,6 +68,7 @@ import {
   chatActivityEvents,
 } from "../../../../lib/chat-session-events";
 import { deliverPendingDesktopIslandNewChat } from "../../../../lib/desktop-island";
+import { onChatInsertRequested } from "../../../../lib/chat-insert-bus";
 import { workspaceProjectFilter } from "../../../../lib/project-load";
 import { canvasDisabledRedirect } from "../../../../lib/project-preview-tab";
 import { resolveActiveWorkspaceId } from "../../../../lib/workspace-store";
@@ -101,6 +103,12 @@ import {
   previewWakeUrl,
   isApiGateLatched,
   latchApiGate,
+  previewActiveUrl,
+  decidePreviewPing,
+  previewRecoveryAttempts,
+  recordPreviewRecovery,
+  PREVIEW_ACTIVE_PING_MS,
+  type PreviewActivePing,
 } from "../../../../lib/preview-gate";
 import {
   decideAutoOpenPreview,
@@ -1352,6 +1360,15 @@ export default observer(function ProjectLayout() {
   const reconnect = useCallback(() => {
     setIframeRefreshKey((k) => k + 1);
   }, []);
+
+  // The canvas noticed its runtime is gone (evicted, or respawned on a new
+  // port) — SHO-226. Re-resolving `/sandbox/url` restarts the runtime if it was
+  // stopped and returns the new URL; `retryAgentUrl` drops the warm cache first
+  // so that re-poll is authoritative rather than seeded with the dead port.
+  const recoverPreview = useCallback(() => {
+    retryAgentUrl();
+    setIframeRefreshKey((k) => k + 1);
+  }, [retryAgentUrl]);
 
   // Load project data
   const domainsReady = sdkReady && !!store?.projectCollection;
@@ -2866,6 +2883,13 @@ export default observer(function ProjectLayout() {
       window.removeEventListener("shogo:chat:open-with-context", handler);
   }, [openChatWithContextInCurrentWindow]);
 
+  // "Add to Chat" reveals a chat panel the user collapsed. Narrow layouts keep
+  // their current tab; the bus queues the request until a composer mounts.
+  useEffect(() => {
+    if (Platform.OS !== "web" || !isWide) return;
+    return onChatInsertRequested(() => setChatCollapsed(false));
+  }, [isWide]);
+
   // Let the sidebar switch this project's chats IN PLACE (no navigation /
   // remount) while the project is already open. The sidebar emits a select
   // request instead of router.push when its row is the active project.
@@ -3705,6 +3729,7 @@ export default observer(function ProjectLayout() {
       projectId={projectId}
       techStackId={techStackId}
       onRefresh={reconnect}
+      onRecover={recoverPreview}
       // True whenever the canvas owns the entire viewport (chat fullscreen
       // / collapsed in wide split, or narrow with the canvas tab active).
       // Drives the canvas's own left margin: when the chat panel is
@@ -5250,6 +5275,7 @@ function CanvasPanel({
   projectId,
   techStackId,
   onRefresh,
+  onRecover,
   fullBleed = false,
   iframeRefreshKey = 0,
   onCanvasCapabilities,
@@ -5261,6 +5287,11 @@ function CanvasPanel({
   projectId?: string;
   techStackId?: string;
   onRefresh?: () => void;
+  /**
+   * Re-resolve `/sandbox/url` and remount the iframe — the recovery path when
+   * this preview's runtime is gone or has moved to a new port (SHO-226).
+   */
+  onRecover?: () => void;
   fullBleed?: boolean;
   iframeRefreshKey?: number;
   onCanvasCapabilities?: (caps: { supportsTheme: boolean }) => void;
@@ -5382,6 +5413,92 @@ function CanvasPanel({
     const timer = setTimeout(() => setBaseTimedOut(true), BASE_TIMEOUT_MS);
     return () => clearTimeout(timer);
   }, [baseReady]);
+
+  // -------------------------------------------------------------------------
+  // "Is this preview still alive?" (SHO-226)
+  //
+  // The iframe talks straight to `localhost:<agentPort>/p/<id>`, so after
+  // `/sandbox/url` the API never hears from this preview again: the
+  // warm-preview LRU and the worker's idle reaper both see it as idle and one
+  // of them stops it under the user, leaving the iframe on a dead port with no
+  // way back. So while the canvas is actually on screen, ping
+  // `preview/active` (which pins the runtime) and recover when it says the
+  // runtime is gone or has respawned on a different port.
+  // -------------------------------------------------------------------------
+  const [canvasVisible, setCanvasVisible] = useState(true);
+  useEffect(() => {
+    if (Platform.OS === "web") {
+      const doc = (globalThis as { document?: Document }).document;
+      if (!doc) return;
+      const sync = () => setCanvasVisible(doc.visibilityState === "visible");
+      sync();
+      doc.addEventListener("visibilitychange", sync);
+      return () => doc.removeEventListener("visibilitychange", sync);
+    }
+    const sync = (state: string) => setCanvasVisible(state === "active");
+    sync(AppState.currentState);
+    const sub = AppState.addEventListener("change", sync);
+    return () => sub.remove();
+  }, []);
+
+  // Whether this canvas has seen the project's runtime reported live. Recovery
+  // is only ever triggered by *losing* something: `running:false` on the first
+  // ping is how a sleeping machine workspace, a remote runtime and a preview
+  // that has not started yet all answer, and re-resolving on that would wake or
+  // restart a project nobody asked about.
+  const pingSeenRunningRef = useRef(false);
+
+  useEffect(() => {
+    if (!canvasVisible || !projectId || !API_URL || !canvasBaseUrl || !agentUrl) return;
+    let cancelled = false;
+
+    const ping = async () => {
+      // Offline: the request cannot reach the API, so its result would say
+      // nothing about the runtime — and treating it as "gone" used to restart a
+      // runtime that was happily mid-turn.
+      const online =
+        typeof navigator === "undefined" || navigator.onLine !== false;
+      let body: PreviewActivePing | null = null;
+      if (online) {
+        try {
+          const res = await agentFetch(previewActiveUrl(API_URL!, projectId), {
+            method: "POST",
+          });
+          body = res.ok ? ((await res.json()) as PreviewActivePing) : null;
+        } catch {
+          body = null;
+        }
+      }
+      if (cancelled) return;
+      const verdict = decidePreviewPing({
+        ping: body,
+        canvasBaseUrl,
+        failures: previewRecoveryAttempts(projectId),
+        seenRunning: pingSeenRunningRef.current,
+        online,
+      });
+      pingSeenRunningRef.current = verdict.seenRunning;
+      // Module scope, not a ref: recovering unmounts this canvas, so a ref
+      // would restart the count and the give-up below could never fire.
+      recordPreviewRecovery(projectId, verdict.failures);
+      if (verdict.decision === "recover") {
+        console.warn(
+          `[preview/active] runtime gone or moved (attempt ${verdict.failures}) — re-resolving`
+        );
+        onRecover?.();
+      } else if (verdict.decision === "give-up") {
+        console.warn("[preview/active] giving up after repeated failures");
+        setBaseTimedOut(true);
+      }
+    };
+
+    void ping();
+    const timer = setInterval(() => void ping(), PREVIEW_ACTIVE_PING_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [canvasVisible, projectId, canvasBaseUrl, agentUrl, onRecover]);
 
   const [apiWaitElapsed, setApiWaitElapsed] = useState(false);
   const apiWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -5579,6 +5696,12 @@ function usePreviewPhase(
   running: boolean;
   apiReady: boolean;
   apiServerPhase: string;
+  /**
+   * Consecutive `/preview/status` poll failures (0 as soon as one succeeds).
+   * The canvas treats two in a row as "the runtime behind this preview is
+   * gone" and re-resolves (SHO-226).
+   */
+  statusErrors: number;
 } {
   const [phase, setPhase] = useState<string>("idle");
   const [running, setRunning] = useState<boolean>(false);
@@ -5588,6 +5711,7 @@ function usePreviewPhase(
   // gate degrades to the old `running`-only behaviour instead of hanging.
   const [apiReady, setApiReady] = useState<boolean>(false);
   const [apiServerPhase, setApiServerPhase] = useState<string>("idle");
+  const [statusErrors, setStatusErrors] = useState<number>(0);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const inFlightRef = useRef(false);
   const kickedStartRef = useRef(false);
@@ -5602,6 +5726,7 @@ function usePreviewPhase(
     setRunning(false);
     setApiReady(false);
     setApiServerPhase("idle");
+    setStatusErrors(0);
     kickedStartRef.current = false;
 
     if (!statusBase) return;
@@ -5617,6 +5742,7 @@ function usePreviewPhase(
         if (cancelled) return;
         if (resp.ok) {
           const data = await resp.json();
+          setStatusErrors(0);
           if (data.phase) setPhase(data.phase);
           if (data.apiServerPhase) setApiServerPhase(data.apiServerPhase);
           setApiReady(resolveApiReady(data));
@@ -5644,10 +5770,12 @@ function usePreviewPhase(
           }
         } else {
           console.warn("[preview/status]", resp.status, statusBase);
+          setStatusErrors((n) => n + 1);
         }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         console.warn("[preview/status] poll failed", message);
+        if (!cancelled) setStatusErrors((n) => n + 1);
       } finally {
         inFlightRef.current = false;
       }
@@ -5665,7 +5793,7 @@ function usePreviewPhase(
     };
   }, [statusBase, pollTimeoutMs]);
 
-  return { phase, running, apiReady, apiServerPhase };
+  return { phase, running, apiReady, apiServerPhase, statusErrors };
 }
 
 function AppPreviewPanel({

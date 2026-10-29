@@ -28,6 +28,9 @@ const REQUIRED_LOCAL_ROUTES = [
   'GET /api/projects/:projectId/thumbnail.png',
   'POST /api/projects/:projectId/thumbnail/capture',
   'POST /api/projects/:projectId/runtime/prewarm',
+  // SHO-226: the visible canvas pings this so the preview on screen is never
+  // the warm-preview LRU victim. Desktop is the surface that evicts.
+  'POST /api/projects/:projectId/preview/active',
   'POST /api/generate-project-name',
   'GET /api/templates',
   'POST /api/workspaces/personal',
@@ -127,8 +130,6 @@ const REQUIRED_LOCAL_ROUTES = [
 
 /** Runtime → API paths that intentionally only exist in the cloud API. */
 const CLOUD_ONLY_RUNTIME_PATHS = new Set([
-  // Publishing deploys to `*.shogo.one`; desktop has no publish pipeline.
-  '/api/internal/projects/:param/publish',
   // Cross-project previews (SHO-125): another project is served by its own pod
   // on metal, and desktop has no metal substrate — `isMetalRuntime()` is false
   // there, so `preview_project` takes the local `/p/<id>/preview/start` path

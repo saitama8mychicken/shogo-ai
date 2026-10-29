@@ -357,6 +357,14 @@ describe('GPT-Live session routes', () => {
     })
   })
 
+  test('live session omits audio.format because WebRTC negotiates it', async () => {
+    const res = await post('/voice/live/session/session-1', { sdp: 'offer-sdp' })
+
+    expect(res.status).toBe(200)
+    expect(liveSessionCalls[0].session.audio).not.toHaveProperty('format')
+    expect(liveSessionCalls[0].session.audio.output.voice).toBe('marin')
+  })
+
   test('live session rejects a missing sdp and unauthorized sessions', async () => {
     expect((await post('/voice/live/session/session-1', {})).status).toBe(400)
     sessionAllowed = false

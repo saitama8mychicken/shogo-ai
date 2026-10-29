@@ -680,7 +680,8 @@ export function voiceRoutes() {
       model: process.env.SHOGO_EZ_MODE_LIVE_MODEL || 'gpt-live-1',
       instructions: composeVoiceSystemPrompt(TRANSLATOR_LIVE_CONVERSATION_PROMPT, contextBlock),
       audio: {
-        format: { type: 'audio/pcm', rate: 24000 },
+        // No `format`: WebRTC negotiates media through SDP, and the Live API
+        // rejects `audio.format` on anything but a primary WebSocket.
         output: {
           voice: process.env.SHOGO_EZ_MODE_LIVE_VOICE || 'marin',
         },

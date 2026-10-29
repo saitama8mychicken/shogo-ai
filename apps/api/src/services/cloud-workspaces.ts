@@ -50,12 +50,37 @@ async function load(): Promise<Stored> {
   try {
     if (row?.value) parsed = { ...parsed, ...JSON.parse(row.value) }
   } catch {}
-  parsed.workspaces = parsed.workspaces.map((w) => ({ ...w, kind: w.kind === 'personal' ? 'personal' : 'team' }))
+  parsed.workspaces = await withoutLocalWorkspaces(
+    parsed.workspaces.map((w) => ({ ...w, kind: w.kind === 'personal' ? 'personal' : 'team' })),
+  )
   cache = parsed
   return parsed
 }
 
+/**
+ * A workspace that exists in this desktop's SQLite is local, whatever the cloud
+ * says: the cloud's machine copy of it (SHO-185) carries the same id, and
+ * treating it as a cloud workspace relays this machine's own writes to that
+ * read-only copy.
+ */
+async function withoutLocalWorkspaces(workspaces: CloudWorkspaceEntry[]): Promise<CloudWorkspaceEntry[]> {
+  if (!workspaces.length || !localDb.workspace?.findMany) return workspaces
+  let local: Array<{ id: string }> = []
+  try {
+    local = await localDb.workspace.findMany({
+      where: { id: { in: workspaces.map((w) => w.id) } },
+      select: { id: true },
+    })
+  } catch {
+    return workspaces
+  }
+  if (!local.length) return workspaces
+  const localIds = new Set(local.map((w) => w.id))
+  return workspaces.filter((w) => !localIds.has(w.id))
+}
+
 async function save(next: Stored): Promise<void> {
+  next = { ...next, workspaces: await withoutLocalWorkspaces(next.workspaces) }
   cache = next
   const value = JSON.stringify(next)
   await localDb.localConfig.upsert({ where: { key: CONFIG_KEY }, update: { value }, create: { key: CONFIG_KEY, value } })
@@ -156,20 +181,8 @@ export function syncCloudWorkspaces(): Promise<void> {
         if (resolved) next.push({ id: workspace.id, name: workspace.name, slug: workspace.slug ?? null, kind, key: resolved })
       }
       const user = stored.user ?? (await keyInfoUser())
-      const changed = !sameKeySet(stored.workspaces, next)
       await save({ ...stored, enabled: true, user, workspaces: next, syncedAt: new Date().toISOString() })
       reachable = true
-      // A workspace joined (or left) since this process started has no tunnel
-      // yet: the fan-out is built at boot, so without this the machine only
-      // registers in it after an app restart. Loaded lazily — the tunnel module
-      // reads this one, and a static import would close the loop.
-      if (changed) {
-        void import('../lib/instance-tunnel')
-          .then((m) => m.syncWorkspaceTunnels())
-          .catch((err: any) =>
-            console.warn('[CloudWorkspaces] tunnel sync failed:', err?.message ?? err),
-          )
-      }
     } catch {
       reachable = false
     }
@@ -177,16 +190,6 @@ export function syncCloudWorkspaces(): Promise<void> {
     inflight = null
   })
   return inflight
-}
-
-/**
- * Does this sync change what the tunnels were built from? True when a workspace
- * was added, removed, or handed a new device key.
- */
-function sameKeySet(a: CloudWorkspaceEntry[], b: CloudWorkspaceEntry[]): boolean {
-  if (a.length !== b.length) return false
-  const byId = new Map(a.map((w) => [w.id, w.key]))
-  return b.every((w) => byId.get(w.id) === w.key)
 }
 
 export function startCloudWorkspaceSync(): void {

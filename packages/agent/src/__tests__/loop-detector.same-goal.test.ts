@@ -15,11 +15,14 @@ import { LoopDetector } from '../loop-detector'
 
 describe('LoopDetector — no-progress / same-goal heuristic', () => {
   test('varied tool calls that ALL fail on one goal are flagged as a loop', () => {
-    const d = new LoopDetector()
+    // The no-progress stop is off by default; this test opts in at the
+    // historical threshold of 5 consecutive unproductive turns.
+    const d = new LoopDetector({ maxConsecutiveNoProgress: 5 })
 
-    // Six genuinely different attempts at the same unreachable endpoint. Every
-    // command differs and every error differs, so identical-call / identical-
-    // output / cycle detection cannot fire — only a no-progress heuristic can.
+    // Six genuinely different attempts at the same unreachable endpoint, one per
+    // turn. Every command differs and every error differs, so identical-call /
+    // identical-output / cycle detection cannot fire — only a no-progress
+    // heuristic can.
     const attempts = [
       { command: 'curl http://metrics.internal:9000/api/signups', stderr: 'Could not resolve host: metrics.internal' },
       { command: 'curl -v http://metrics.internal:9000/api/signups', stderr: 'Connection timed out after 3000 ms' },
@@ -31,7 +34,8 @@ describe('LoopDetector — no-progress / same-goal heuristic', () => {
 
     let last
     for (const a of attempts) {
-      last = d.recordAndCheck('exec', { command: a.command }, { exitCode: 1, stdout: '', stderr: a.stderr })
+      d.recordAndCheck('exec', { command: a.command }, { exitCode: 1, stdout: '', stderr: a.stderr })
+      last = d.recordTurnEnd()
     }
 
     expect(last?.loopDetected).toBe(true)
@@ -53,7 +57,10 @@ describe('LoopDetector — no-progress / same-goal heuristic', () => {
     ]
 
     let last
-    for (const s of steps) last = d.recordAndCheck(s.name, s.input, s.output)
+    for (const s of steps) {
+      d.recordAndCheck(s.name, s.input, s.output)
+      last = d.recordTurnEnd()
+    }
 
     expect(last?.loopDetected).toBe(false)
   })
@@ -61,7 +68,8 @@ describe('LoopDetector — no-progress / same-goal heuristic', () => {
   test('regression guard: the identical-call detector still fires at 10', () => {
     const d = new LoopDetector()
     let last
-    // Successful outputs on purpose: 5 failing ones would trip no_progress first.
+    // Successful outputs on purpose: the identical-call detector is what this
+    // test guards, not the (default-off) no-progress heuristic.
     for (let i = 0; i < 10; i++) {
       last = d.recordAndCheck('exec', { command: 'curl http://x' }, { exitCode: 0, stdout: 'ok' })
     }

@@ -394,9 +394,10 @@ export function useLiveVoiceConversation(
     })
   }, [sendEvent])
 
-  const sendUserActivity = useCallback(() => {
-    sendEvent({ type: 'session.input_audio.commit' })
-  }, [sendEvent])
+  // GPT-Live manages turn-taking itself and has no commit / user-activity
+  // client event, so there is nothing to nudge. Callers treat this as a
+  // best-effort hint; sending an unsupported event makes the API reject it.
+  const sendUserActivity = useCallback(() => {}, [])
 
   const getOutputByteFrequencyData = useCallback(() => {
     return frequencyRef.current

@@ -186,6 +186,7 @@ import {
 } from './middleware/api-auth-gate'
 import { homeRegionWriteProxy } from './middleware/home-region-router'
 import { machineWorkspaceWriteGuard } from './lib/machine-workspace'
+import { machineCopyPendingGuard } from './lib/machine-copy-pending'
 import { tracingMiddleware } from './middleware/tracing'
 import { rateLimiter } from './middleware/rate-limit'
 
@@ -240,6 +241,7 @@ const STRIPE_API_VERSION: any = cloud.STRIPE_API_VERSION
 const resolveInvoiceSubscriptionId: any = cloud.resolveInvoiceSubscriptionId ?? (() => null)
 const proxyToPeer: any = cloud.proxyToPeer ?? (async () => new Response('Cloud peer routing unavailable', { status: 503 }))
 const publishRoutes: any = cloud.publishRoutes ?? emptyRouter
+const publishedSitesRoutes: any = cloud.publishedSitesRoutes ?? emptyRouter
 const slackAgentRoutes: any = cloud.slackAgentRoutes ?? emptyRouter
 const projectAdminRoutes: any = cloud.projectAdminRoutes ?? emptyRouter
 const publicApiRoutes: any = cloud.publicApiRoutes ?? emptyRouter
@@ -853,6 +855,12 @@ app.use('/api/*', homeRegionWriteProxy)
 // `409 machine_workspace_write_via_tunnel` instead of silently diverging from
 // the machine the user is looking at (SHO-185).
 app.use('/api/*', machineWorkspaceWriteGuard())
+
+// A read of a machine workspace the cloud has no copy of yet answered "No access
+// to this workspace", which the client could not act on. It now answers
+// `409 machine_copy_pending` and the client retries through the relay (SHO-241).
+// Registered as a post-response hook, so a request that succeeds pays nothing.
+app.use('/api/*', machineCopyPendingGuard())
 
 // Better Auth handler - mounted BEFORE other /api/* routes
 // Handles all authentication endpoints: sign-up, sign-in, sign-out, session, OAuth callbacks, etc.
@@ -1915,6 +1923,49 @@ app.post('/api/projects/:projectId/republish', async (c) => {
     headers: c.req.raw.headers,
     body: c.req.raw.body,
   })
+  return router.fetch(newReq)
+})
+
+// Desktop publishing (SHO-245): the desktop builds the bundle on the user's
+// machine and uploads it here, and these routes host it. API-key auth only —
+// machine-to-machine, never the browser.
+app.post('/api/published-sites/:sourceProjectId', async (c) => {
+  const router = publishedSitesRoutes()
+  const url = new URL(c.req.url)
+  url.pathname = `/published-sites/${c.req.param('sourceProjectId')}`
+  const newReq = new Request(url.toString(), {
+    method: 'POST',
+    headers: c.req.raw.headers,
+    body: c.req.raw.body,
+  })
+  return router.fetch(newReq)
+})
+
+app.patch('/api/published-sites/:sourceProjectId', async (c) => {
+  const router = publishedSitesRoutes()
+  const url = new URL(c.req.url)
+  url.pathname = `/published-sites/${c.req.param('sourceProjectId')}`
+  const newReq = new Request(url.toString(), {
+    method: 'PATCH',
+    headers: c.req.raw.headers,
+    body: c.req.raw.body,
+  })
+  return router.fetch(newReq)
+})
+
+app.post('/api/published-sites/:sourceProjectId/unpublish', async (c) => {
+  const router = publishedSitesRoutes()
+  const url = new URL(c.req.url)
+  url.pathname = `/published-sites/${c.req.param('sourceProjectId')}/unpublish`
+  const newReq = new Request(url.toString(), { method: 'POST', headers: c.req.raw.headers })
+  return router.fetch(newReq)
+})
+
+app.get('/api/published-sites/:sourceProjectId', async (c) => {
+  const router = publishedSitesRoutes()
+  const url = new URL(c.req.url)
+  url.pathname = `/published-sites/${c.req.param('sourceProjectId')}`
+  const newReq = new Request(url.toString(), { method: 'GET', headers: c.req.raw.headers })
   return router.fetch(newReq)
 })
 

@@ -74,6 +74,18 @@ async function connect(options: Partial<Parameters<typeof useLiveVoiceConversati
   return { conversation, channel, receive }
 }
 
+describe('useLiveVoiceConversation user activity', () => {
+  test('sendUserActivity sends nothing because GPT-Live has no commit event', async () => {
+    const { conversation, channel } = await connect()
+    const before = channel.sent.length
+
+    conversation.sendUserActivity()
+
+    expect(channel.sent).toHaveLength(before)
+    expect(channel.sent.some((e) => e.type === 'session.input_audio.commit')).toBe(false)
+  })
+})
+
 describe('useLiveVoiceConversation client delegation', () => {
   test('answers a delegation with the transcript and returns spoken commentary', async () => {
     const onDelegation = mock(async () => 'I queued the blue header change.')

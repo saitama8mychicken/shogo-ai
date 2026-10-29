@@ -84,6 +84,7 @@ import {
   type VoiceOp,
 } from './ops.js'
 import { extractBasePrompt } from './prompt.js'
+import { readRuntimeAuthSecret } from './runtime-token.js'
 import type {
   Companion,
   CompanionStore,
@@ -303,7 +304,7 @@ function resolveProxyOptions(
       LOG_WARN_CACHE.apiKeyIgnored(config.logger)
     }
     if (typeof process === 'undefined' || !process.env) return null
-    const runtimeToken = process.env.RUNTIME_AUTH_SECRET
+    const runtimeToken = readRuntimeAuthSecret()
     const projectId = process.env.PROJECT_ID
     if (!runtimeToken || !projectId) return null
     return {
@@ -1102,6 +1103,15 @@ export function createVoiceHandlers(config: VoiceHandlersConfig): VoiceHandlers 
     }
 
     const raw = await readJson(req)
+    if (raw && typeof raw === 'object' && (raw as { provider?: unknown }).provider === 'google') {
+      return json(
+        {
+          error: 'provider_unavailable',
+          detail: 'Lyria music runs through the Shogo API; this BYO handler only has an ElevenLabs key',
+        },
+        400,
+      )
+    }
     const parsed = parseMusicBody(raw)
     if ('error' in parsed) return json({ error: parsed.error }, 400)
 
@@ -1192,6 +1202,16 @@ export function createVoiceHandlers(config: VoiceHandlersConfig): VoiceHandlers 
       }
 
       if (op.call === 'composeMusic') {
+        if (fields.provider === 'google') {
+          return json(
+            {
+              error: 'provider_unavailable',
+              detail:
+                'Lyria music runs through the Shogo API; this BYO handler only has an ElevenLabs key',
+            },
+            400,
+          )
+        }
         const { audio, contentType } = await el.composeMusic({
           ...(typeof fields.prompt === 'string' ? { prompt: fields.prompt } : {}),
           ...(fields.compositionPlan

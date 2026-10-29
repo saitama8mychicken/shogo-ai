@@ -36,7 +36,13 @@ import {
   planContinuationLimit,
   shouldContinuePlan,
 } from './plan-continuation'
-import { interruptedTurnResumePrompt } from '@shogo/shared-runtime/interrupted-turn'
+import { interruptedTurnResumePrompt, resumeMaxAgeMinutes } from '@shogo/shared-runtime/interrupted-turn'
+import {
+  heartbeatSessionIdFor,
+  heartbeatSessionProjectId,
+  isHeartbeatChatSessionId,
+} from '@shogo/shared-runtime/heartbeat-session'
+import { formatHeartbeatModelLog, resolveHeartbeatModel } from './heartbeat-model'
 import { sweepExecCwdMarkers } from './exec-cwd'
 import { TEAM_CHAT_GUIDE, teamChatToolsAvailable } from './channel-tools'
 import { TRIGGERS_GUIDE, triggerToolsAvailable } from './trigger-tools'
@@ -105,6 +111,7 @@ import {
   type AutoTierOverride,
 } from './model-router'
 import { buildCodeAgentGeneralGuide, OUTPUT_CONTRACT_GUIDE } from './code-agent-prompt'
+import { restrictToReadOnlyTools } from './read-only-command'
 import { isSearchEnabled } from './search-flag'
 import { smartTruncateJson } from './response-transforms'
 import { getShogoSdkGuide } from './shogo-sdk-prompt'
@@ -202,6 +209,23 @@ work visible, and communicate in concise user-facing language.
   project. If they say it anyway, follow this guide.
 - Do not expose internal project ids or builder mechanics unless the user asks.
 `
+
+/**
+ * The runtime's own listening ports: the SPA on `PORT` plus the API sidecar.
+ * The public preview origin serves exactly these (the SPA at its root, and
+ * `/api/*` proxied to the sidecar), so they are the only localhost ports the
+ * link rewriter may swap for it inside code spans and on `curl` lines — see
+ * `preview-link-rewrite.ts` and SHO-239.
+ */
+export function ownPreviewPorts(
+  previewManager: import('./preview-manager').PreviewManager | null | undefined,
+): number[] {
+  const ports = [parseInt(process.env.PORT || '8080', 10)]
+  const match = /:(\d+)\/?$/.exec(previewManager?.apiServerUrl ?? '')
+  const apiPort = match ? Number(match[1]) : NaN
+  if (Number.isInteger(apiPort) && apiPort > 0 && !ports.includes(apiPort)) ports.push(apiPort)
+  return ports.filter((p) => Number.isInteger(p) && p > 0)
+}
 
 function isComposioTool(name: string): boolean {
   return /^[A-Z]+_/.test(name)
@@ -334,12 +358,6 @@ const TURN_REMOTE_REFRESH_MS = 10_000
  * session on every tool call of a long turn.
  */
 const INFLIGHT_TOOL_MARKER_MS = 2_000
-/**
- * A turn interrupted longer ago than this is left alone: the person has moved
- * on, and a resume that re-reads ancient work costs a full model call.
- * `AGENT_RESUME_MAX_AGE_MINUTES=0` disables the boot sweep.
- */
-const DEFAULT_RESUME_MAX_AGE_MINUTES = 360
 
 /**
  * How much of a tool result is searched for a `/f/<token>` share link. Share
@@ -525,6 +543,16 @@ export type VisualMode = 'canvas' | 'app' | 'none'
  * project chat or vice versa.
  */
 export type ChatContext = 'workspace' | 'project'
+
+/**
+ * What started a turn (SHO-227).
+ *
+ * Only `person` — someone actually writing in this session — clears the
+ * session's automatic restarts. The rest are the machine's own bookkeeping
+ * (`task-wake`, `resume`) or a clock (`heartbeat`), and a session that keeps
+ * restarting itself must not be able to fake any of them.
+ */
+export type TurnOrigin = 'person' | 'task-wake' | 'resume' | 'heartbeat'
 /** Separator between two prompt sections in the system prompt. */
 const SECTION_SEPARATOR = '\n\n---\n\n'
 
@@ -786,7 +814,7 @@ export class AgentGateway {
   private running = false
   private lastHeartbeatTick: Date | null = null
   private hookEmitter: HookEmitter = new HookEmitter()
-  private pendingEvents: string[] = []
+  private pendingEvents: Array<{ projectId: string | null; text: string }> = []
   private sessionManager: SessionManager
   private sessionPersistence: SqliteSessionPersistence | null = null
   private mcpClientManager: MCPClientManager = new MCPClientManager()
@@ -2155,6 +2183,9 @@ export class AgentGateway {
     quietHours: { start: '', end: '', timezone: 'UTC' },
   }
 
+  /** Makes each tick's session id distinct within this process (SHO-178). */
+  private heartbeatTickSeq = 0
+
   /** Reload the cached schedule from the project config API (best effort). */
   async refreshHeartbeatSnapshot(): Promise<void> {
     const projectId = projectScopedId(this.projectId) ?? projectScopedId(process.env.WORKSPACE_ANCHOR_PROJECT_ID)
@@ -2203,11 +2234,21 @@ export class AgentGateway {
     console.log('[AgentGateway] Running heartbeat...')
     this.emitLog('Running heartbeat...')
 
-    let pendingSection = ''
-    if (this.pendingEvents.length > 0) {
-      pendingSection = `\n\n[Pending Events]\n${this.pendingEvents.join('\n')}`
-      this.pendingEvents = []
-    }
+    // A tick starts from an empty transcript (SHO-178). Every tick used to run
+    // in one shared `heartbeat` session, so in production a single turn key
+    // stayed open for ten days, re-sent its whole history every firing, and
+    // billed ~$467 in 24h. The per-tick id is namespaced by project so two
+    // attached projects can never read each other's history and analytics can
+    // attribute the spend to the project the tick was for (SHO-182).
+    const tickProjectId = this.heartbeatTickProjectId(opts.projectId)
+    const sessionId = heartbeatSessionIdFor(tickProjectId ?? '', this.nextHeartbeatTickId())
+
+    // What the tick used to get for free from the shared transcript. Only this
+    // project's notes plus the unscoped ones — a workspace runtime's other
+    // projects' background work is not this tick's business.
+    const mine = this.pendingEvents.filter((e) => e.projectId === null || e.projectId === tickProjectId)
+    this.pendingEvents = this.pendingEvents.filter((e) => !(e.projectId === null || e.projectId === tickProjectId))
+    const pendingSection = mine.map((e) => e.text).join('\n')
 
     // In a workspace runtime the checklist belongs to one attached project,
     // whose files live in a subfolder of the merged root.
@@ -2216,11 +2257,14 @@ export class AgentGateway {
         ? ` for project ${opts.projectId} (its files are under \`${opts.projectId}/\`)`
         : ''
 
-    const response = await this.agentTurn(
-      `[HEARTBEAT]\nYou are performing a scheduled heartbeat check${projectLine}. Review the following checklist and take action as needed. If everything is fine, respond with exactly "HEARTBEAT_OK". If something needs attention, describe the issue and any actions taken.\n\n${checklist}${pendingSection}`,
-      'heartbeat',
-      true
-    )
+    const response = await this.runHeartbeatTurn({
+      sessionId,
+      projectId: opts.projectId,
+      projectDir,
+      prompt:
+        `[HEARTBEAT]\nYou are performing a scheduled heartbeat check${projectLine}. Review the following checklist and take action as needed. If everything is fine, respond with exactly "HEARTBEAT_OK". If something needs attention, describe the issue and any actions taken.\n\n${checklist}` +
+        this.heartbeatStateBlock(projectDir, pendingSection),
+    })
 
     await this.hookEmitter.emit(
       HookEmitter.createEvent('heartbeat', 'tick', 'heartbeat', {
@@ -2257,8 +2301,149 @@ export class AgentGateway {
     return this.heartbeatTick(opts)
   }
 
-  queuePendingEvent(text: string): void {
-    this.pendingEvents.push(text)
+  /**
+   * Run the tick's turn on a session that exists only for this tick, then
+   * forget it. The model is pinned before the turn starts so the Auto router
+   * never sees the tick (SHO-178 Part 2), and the cleanup in `finally` keeps a
+   * per-tick id from turning every session-keyed map in this class into an
+   * unbounded one.
+   */
+  private async runHeartbeatTurn(input: {
+    sessionId: string
+    projectId?: string
+    projectDir: string
+    prompt: string
+  }): Promise<string> {
+    const agent = await this.heartbeatAgentModelSnapshot(input.projectId)
+    const choice = resolveHeartbeatModel({
+      agentModelName: agent?.modelName,
+      agentModelProvider: agent?.modelProvider,
+      runtimeModel: this.config.model,
+      economyTier: this.autoTierOverride?.economy,
+    })
+    const modelLog = formatHeartbeatModelLog(choice)
+    console.log(`${this.logPrefix} ${modelLog}`)
+    this.emitLog(modelLog)
+
+    const session = this.sessionManager.getOrCreate(input.sessionId)
+    session.modelOverride = choice.id
+    session.modelProvider = choice.provider
+    session.modelDisplayName = undefined
+    // Subagents and tool-driven turns this tick spawns infer the same provider.
+    rememberProviderHint(choice.id, choice.provider)
+
+    try {
+      return await this.agentTurn(input.prompt, input.sessionId, true)
+    } finally {
+      await this.disposeHeartbeatSession(input.sessionId)
+    }
+  }
+
+  /**
+   * The project a tick's session id names, or null when nothing resolves.
+   *
+   * Analytics attributes heartbeat spend by this segment (SHO-182) and falls
+   * back to the usage row's own `projectId` when it is absent, so an
+   * unresolvable project must yield `null` — a placeholder like `runtime` would
+   * be read as a real project id and overwrite the row's.
+   */
+  private heartbeatTickProjectId(projectId?: string): string | null {
+    return (
+      projectScopedId(projectId) ??
+      projectScopedId(this.projectId) ??
+      projectScopedId(process.env.WORKSPACE_ANCHOR_PROJECT_ID) ??
+      null
+    )
+  }
+
+  /** Monotonic within this process; sortable, and free of `:` so the id splits cleanly. */
+  private nextHeartbeatTickId(): string {
+    this.heartbeatTickSeq += 1
+    return `${Date.now().toString(36)}-${this.heartbeatTickSeq.toString(36)}`
+  }
+
+  /**
+   * The state a tick needs, spelled out instead of inherited from a transcript:
+   * what the last checks concluded, and anything that arrived since.
+   */
+  private heartbeatStateBlock(projectDir: string, pendingEvents: string): string {
+    let block = ''
+    const logTail = this.readHeartbeatLogTail(projectDir)
+    if (logTail) {
+      block += `\n\n## Recent heartbeat results\nYour own last checks, oldest first. Do not repeat work they already finished.\n${logTail}`
+    }
+    if (pendingEvents) {
+      block += `\n\n## Pending Events\n${pendingEvents}`
+    }
+    return block
+  }
+
+  /** A project's heartbeat log entries. `appendHeartbeatLog` already caps it at 20. */
+  private readHeartbeatLogTail(dir: string): string {
+    const logPath = join(dir, 'HEARTBEAT_LOG.md')
+    if (!existsSync(logPath)) return ''
+    try {
+      return readFileSync(logPath, 'utf-8')
+        .split('\n')
+        .filter((line) => line.startsWith('- ['))
+        .join('\n')
+    } catch {
+      return ''
+    }
+  }
+
+  /** `AgentConfig.modelName` for the project this tick is for, best effort. */
+  private async heartbeatAgentModelSnapshot(projectId?: string): Promise<AgentModelSnapshot | null> {
+    const id =
+      projectScopedId(projectId) ??
+      projectScopedId(this.projectId) ??
+      projectScopedId(process.env.WORKSPACE_ANCHOR_PROJECT_ID)
+    if (!id) return null
+    try {
+      const res = await getProjectConfig(id, 3_000)
+      return res.ok ? (res.data?.agent as AgentModelSnapshot | null | undefined) ?? null : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Forget a finished tick's session and everything this class keys by it. A
+   * per-tick id is the point (SHO-178), so nothing may outlive the tick or the
+   * maps that used to hold one `heartbeat` entry grow by one entry per firing.
+   * SHO-137's keep-history behaviour is untouched — it governs real chat
+   * sessions, and a tick's transcript is never one.
+   *
+   * Background work the tick deliberately started is the one thing that does
+   * outlive it: `keepRunningWork` leaves the command registry (and its output
+   * dir) alive until it drains, so a `background: true` scan or build reports
+   * its result instead of being SIGKILLed by the tick's own cleanup.
+   */
+  private async disposeHeartbeatSession(sessionId: string): Promise<void> {
+    await this.sessionManager.deleteSession(sessionId)
+    this.sessionChatContexts.delete(sessionId)
+    this.contentReplacementStates.delete(sessionId)
+    this.sessionImageMaxDimensions.delete(sessionId)
+    this.turnCounters.delete(sessionId)
+    this.turnPrefixes.delete(sessionId)
+    this.turnReachable.delete(sessionId)
+    this.turnPause.delete(sessionId)
+    this.wakeStates.delete(sessionId)
+    this.shellCwd.delete(sessionId)
+    this.queueState.delete(sessionId)
+    this.disposeSessionState(sessionId, { keepRunningWork: true })
+  }
+
+  /**
+   * Carry a note into the next heartbeat instead of waking a turn now.
+   *
+   * `projectId` scopes it to that project's ticks. A workspace runtime serves
+   * several attached projects, and a note from one project's background work
+   * must not turn up in another's heartbeat — the same rule as the transcripts.
+   * Omitted means "whichever tick runs next".
+   */
+  queuePendingEvent(text: string, projectId?: string | null): void {
+    this.pendingEvents.push({ projectId: projectId ?? null, text })
   }
 
   // ---------------------------------------------------------------------------
@@ -2469,6 +2654,8 @@ export class AgentGateway {
       chatSessionId?: string
       /** Surface this chat belongs to (workspace agent vs a project's own chat). */
       chatContext?: ChatContext
+      /** What started this turn; only a person clears the automatic-restart cap. */
+      turnOrigin?: TurnOrigin
     },
   ): Promise<void> {
     // chatSessionId is REQUIRED. The runtime's HTTP layer enforces this
@@ -2581,7 +2768,19 @@ export class AgentGateway {
 
     const dualPlan = options?.dualPlan === true
     console.log(`[Gateway][processChatMessageStream] dualPlan: ${dualPlan}, sessionId: ${sessionId}, activeSkill: ${activeSkill ?? '(none)'}`)
-    const response = await this.agentTurn(prompt, sessionId, false, undefined, writer, activeSkill, images, dualPlan, options?.requesterTicket, options?.chatContext)
+    const response = await this.agentTurn(
+      prompt,
+      sessionId,
+      false,
+      undefined,
+      writer,
+      activeSkill,
+      images,
+      dualPlan,
+      options?.requesterTicket,
+      options?.chatContext,
+      options?.turnOrigin,
+    )
     this.emitLog(`Chat response (stream): "${response.substring(0, 100)}"`)
 
     this.appendDailyMemory(`chat: "${text.substring(0, 100)}" -> "${response.substring(0, 100)}"`)
@@ -2754,6 +2953,11 @@ export class AgentGateway {
   private taskWakeTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private taskWakeRetries = new Map<string, { attempts: number; timer: ReturnType<typeof setTimeout> }>()
   private remoteTaskPollers = new Map<string, ReturnType<typeof setInterval>>()
+  /**
+   * Heartbeat sessions whose command registry is waiting to be wiped once the
+   * work they started finishes, with the listener that will do it (SHO-178).
+   */
+  private deferredRegistryWipes = new Map<string, () => void>()
 
   /**
    * Coalesce finished-task notes for an idle session and hand them to the API,
@@ -2784,6 +2988,17 @@ export class AgentGateway {
       return !(n.apiTracked ?? entry?.apiTracked) && !(n.reported ?? entry?.reported)
     })
     if (notes.length === 0) {
+      this.clearTaskWakeRetry(sessionId)
+      return
+    }
+    // A heartbeat's session never runs again, so the API's wake for it would be
+    // dropped (there is no chat session row to queue into) and the work the tick
+    // started would finish unread. Hand it to the project's next tick instead,
+    // which is where the tick would have reported it anyway (SHO-178).
+    if (isHeartbeatChatSessionId(sessionId)) {
+      const projectId = heartbeatSessionProjectId(sessionId)
+      for (const note of notes) this.queuePendingEvent(formatTaskNotification(note), projectId)
+      reg.markReported(notes.map((n) => n.taskId))
       this.clearTaskWakeRetry(sessionId)
       return
     }
@@ -2846,10 +3061,14 @@ export class AgentGateway {
    * next boot posts the note without resuming: a crash loop cannot spin.
    * `AGENT_RESUME_MAX_AGE_MINUTES=0` turns the sweep off; markers older than
    * the limit are dropped unanswered because the person has moved on.
+   *
+   * `resumeAttempts` is the session's `autoResumesSinceHuman`, which survives a
+   * completed turn — so the cap holds across a watch wake or a pod restart, not
+   * only across a resume that dies (SHO-227).
    */
   async recoverInterruptedTurns(): Promise<void> {
-    const configured = Number.parseInt(process.env.AGENT_RESUME_MAX_AGE_MINUTES ?? '', 10)
-    const maxAgeMinutes = Number.isFinite(configured) ? Math.max(0, configured) : DEFAULT_RESUME_MAX_AGE_MINUTES
+    const configured = process.env.AGENT_RESUME_MAX_AGE_MINUTES
+    const maxAgeMinutes = resumeMaxAgeMinutes(configured)
     if (maxAgeMinutes === 0) return
     const maxAgeMs = maxAgeMinutes * 60_000
     const now = Date.now()
@@ -2866,9 +3085,10 @@ export class AgentGateway {
       }
       const repaired = this.sessionManager.repairInterruptedTail(sessionId)
       const toolName = marker.lastTool ?? repaired[repaired.length - 1]?.toolName
-      const resuming = marker.resumeAttempts === 0
+      // Either count saying "already restarted" is enough: the marker is what the
+      // dead turn wrote, the metadata count is what survives every turn.
+      const resuming = marker.resumeAttempts === 0 && this.autoResumesSinceHuman(sessionId) === 0
       if (resuming) {
-        this.resumeStarts.set(sessionId, marker.resumeAttempts + 1)
         console.warn(
           `${this.logPrefix} Resuming interrupted turn for session ${sessionId}` +
             `${toolName ? ` (was running ${toolName})` : ''}`,
@@ -2904,9 +3124,22 @@ export class AgentGateway {
       console.warn(`${this.logPrefix} Interrupted-turn note for ${sessionId} failed: ${res.error ?? res.status}`)
     }
     if (!resuming) return
-    void this.agentTurn(interruptedTurnResumePrompt(toolName), sessionId).catch((err: any) =>
-      console.warn(`${this.logPrefix} Resumed turn for ${sessionId} failed: ${err?.message ?? err}`),
-    )
+    // Desktop path: the runtime starts the turn itself, so it has to say what
+    // started it — otherwise the resumed turn would look like a person writing
+    // and hand the one-restart cap back (SHO-227).
+    void this.agentTurn(
+      interruptedTurnResumePrompt(toolName),
+      sessionId,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      'resume',
+    ).catch((err: any) => console.warn(`${this.logPrefix} Resumed turn for ${sessionId} failed: ${err?.message ?? err}`))
   }
 
   /**
@@ -3053,26 +3286,61 @@ export class AgentGateway {
   }
 
   /** Tear down per-session bookkeeping. Kills any backgrounded shell runs and releases browsers. */
-  private disposeSessionState(sessionId: string): void {
+  private disposeSessionState(sessionId: string, opts: { keepRunningWork?: boolean } = {}): void {
     const reg = this.commandRegistries.get(sessionId)
+    const keepingWork = !!(opts.keepRunningWork && reg && reg.listRunning().length > 0)
     if (reg) {
       // `clear`: the session is being wiped, so its rows go with it. Hydration
       // falls back to the per-task logs when no snapshot survives, so those have
       // to go too — a footer-less log now restores as `interrupted` (SHO-141),
       // which would otherwise bring a cleared session's tasks back to life.
-      // Not awaited (SHO-144): the wipe itself is synchronous, and clearing a
-      // session must not wait on a tree.
-      void reg.killAll({ clear: true })
-      try { rmSync(taskOutputDir(this.workspaceDir, sessionId), { recursive: true, force: true }) } catch { /* best effort */ }
-      this.commandRegistries.delete(sessionId)
+      if (keepingWork) this.deferCommandRegistryWipe(sessionId, reg!)
+      else this.wipeCommandRegistry(sessionId)
     }
-    const wake = this.taskWakeTimers.get(sessionId)
-    if (wake) clearTimeout(wake)
-    this.taskWakeTimers.delete(sessionId)
-    const poller = this.remoteTaskPollers.get(sessionId)
-    if (poller) clearInterval(poller)
-    this.remoteTaskPollers.delete(sessionId)
+    // Work still running keeps its wake machinery: the completion has to reach
+    // someone, and a cleared timer or poller would drop it silently.
+    if (!keepingWork) {
+      const wake = this.taskWakeTimers.get(sessionId)
+      if (wake) clearTimeout(wake)
+      this.taskWakeTimers.delete(sessionId)
+      const poller = this.remoteTaskPollers.get(sessionId)
+      if (poller) clearInterval(poller)
+      this.remoteTaskPollers.delete(sessionId)
+    }
     void releaseSessionBrowsers(sessionId)
+  }
+
+  /** Kill a session's commands, drop their logs and forget the registry. */
+  private wipeCommandRegistry(sessionId: string): void {
+    const reg = this.commandRegistries.get(sessionId)
+    if (!reg) return
+    // Not awaited (SHO-144): the wipe itself is synchronous, and clearing a
+    // session must not wait on a tree.
+    void reg.killAll({ clear: true })
+    try { rmSync(taskOutputDir(this.workspaceDir, sessionId), { recursive: true, force: true }) } catch { /* best effort */ }
+    this.commandRegistries.delete(sessionId)
+  }
+
+  /**
+   * Wipe a heartbeat's command registry once the work it started has finished.
+   *
+   * The registry is kept keyed by the tick's session id so the completion still
+   * has somewhere to land: `flushTaskWake` hands a heartbeat's result to the
+   * project's next tick (there is no chat session to wake), and that needs the
+   * task's log to still exist. One listener, armed only while work is running,
+   * so a tick that leaves nothing behind is still wiped immediately.
+   */
+  private deferCommandRegistryWipe(sessionId: string, reg: TaskRegistry): void {
+    if (this.deferredRegistryWipes.has(sessionId)) return
+    let draining = false
+    const off = reg.onChange(() => {
+      if (draining || reg.listRunning().length > 0) return
+      draining = true
+      off()
+      this.deferredRegistryWipes.delete(sessionId)
+      void this.flushTaskWake(sessionId).finally(() => this.wipeCommandRegistry(sessionId))
+    })
+    this.deferredRegistryWipes.set(sessionId, off)
   }
 
   // ---------------------------------------------------------------------------
@@ -3092,6 +3360,8 @@ export class AgentGateway {
     requesterTicket?: string,
     /** Surface this turn belongs to (workspace agent vs a project's own chat). */
     chatContext?: ChatContext,
+    /** What started this turn; only a person clears the automatic-restart cap. */
+    turnOrigin?: TurnOrigin,
   ): Promise<string> {
     // Wait for any in-flight turn on this session to finish so the new turn
     // reads a fully-updated session history (important for "continue" after a
@@ -3104,7 +3374,7 @@ export class AgentGateway {
     }
 
     this._currentTask = isHeartbeat ? 'heartbeat' : prompt.slice(0, 120)
-    const turnPromise = this._agentTurnInner(prompt, sessionId, isHeartbeat, streamTarget, uiWriter, activeSkill, images, dualPlan, requesterTicket, chatContext)
+    const turnPromise = this._agentTurnInner(prompt, sessionId, isHeartbeat, streamTarget, uiWriter, activeSkill, images, dualPlan, requesterTicket, chatContext, turnOrigin)
     this.turnLocks.set(sessionId, turnPromise)
     try {
       return await turnPromise
@@ -3128,6 +3398,7 @@ export class AgentGateway {
     dualPlan: boolean = false,
     requesterTicket?: string,
     chatContext?: ChatContext,
+    turnOrigin?: TurnOrigin,
   ): Promise<string> {
     // Resolve the surface up front and remember it for the session, so every
     // capability decision this turn makes — tools, prompt block, the
@@ -3462,7 +3733,7 @@ export class AgentGateway {
     if (this.config.coordinatorMode) {
       restrictedMode = 'coordinator'
       const { COORDINATOR_READONLY_TOOLS } = await import('./coordinator-prompt')
-      assembledTools = assembledTools.filter(t => COORDINATOR_READONLY_TOOLS.has(t.name))
+      assembledTools = restrictToReadOnlyTools(assembledTools, COORDINATOR_READONLY_TOOLS)
     }
 
     // WS7: guarantee the core tools are always callable.
@@ -3780,8 +4051,14 @@ export class AgentGateway {
     const previewPublicUrl = (this.previewManager?.isLocalMode ?? detectLocalMode())
       ? ''
       : (process.env.PUBLIC_PREVIEW_URL ?? '')
+    // The runtime's own ports (the SPA on `PORT`, and the API sidecar). The
+    // public preview origin serves exactly these — the SPA at the root and
+    // `/api/*` proxied to the sidecar — so a reference to them is rewritten
+    // even inside code spans or on a `curl` line (SHO-239). Other ports and a
+    // bare `localhost` inside code stay untouched.
+    const ownPorts = ownPreviewPorts(this.previewManager)
     const shareLinkTokens = this.shareLinkTokensFor(sessionId)
-    let linkRewriter = new LocalhostLinkRewriter(previewPublicUrl, shareLinkTokens)
+    let linkRewriter = new LocalhostLinkRewriter(previewPublicUrl, shareLinkTokens, ownPorts)
 
     // Forward streamed assistant text (post-rewrite) to the chunker + UI,
     // opening a UI text block lazily on first non-empty content.
@@ -3811,7 +4088,7 @@ export class AgentGateway {
     const discardFailedStep = (retry: { attempt: number; maxAttempts?: number; reason: string; delayMs: number }) => {
       // Drop any text the rewriter was holding from the failed attempt and
       // reset its scanner state so the regenerated output starts clean.
-      linkRewriter = new LocalhostLinkRewriter(previewPublicUrl, shareLinkTokens)
+      linkRewriter = new LocalhostLinkRewriter(previewPublicUrl, shareLinkTokens, ownPorts)
       if (uiWriter && uiTextId) {
         uiWriter.write({ type: 'text-end', id: uiTextId })
         uiTextId = null
@@ -3870,6 +4147,9 @@ export class AgentGateway {
     // Only a chat session can be resumed on boot, so only a chat session gets a
     // marker — a pipeline or `default` session would just be noise in the sweep.
     const tracksInflightTurn = !!sessionId && !isHeartbeat && isChatSessionId(sessionId)
+    // Count this turn against the session's one automatic restart before the
+    // marker below reads the count (SHO-227). A person's message clears it.
+    if (tracksInflightTurn) this.noteTurnOrigin(sessionId, turnOrigin ?? 'person')
     let inflightMarkerWrite = 0
     const stampInflightTurn = (lastTool?: string) => {
       if (!tracksInflightTurn) return
@@ -3878,9 +4158,11 @@ export class AgentGateway {
           id: inflightTurnId,
           startedAt: inflightStartedAt,
           ...(lastTool ? { lastTool } : {}),
-          // Set when this turn *is* a boot-sweep resume: if it also dies, the
-          // next boot posts the note instead of resuming again.
-          resumeAttempts: this.resumeStarts.get(sessionId) ?? 0,
+          // Automatic restarts already spent since a person last wrote: if this
+          // turn also dies, the next boot posts the note instead of resuming
+          // again. Kept on the session, not in memory, so a resume that ends
+          // normally does not hand the cap back (SHO-227).
+          resumeAttempts: this.autoResumesSinceHuman(sessionId),
         },
       })
       inflightMarkerWrite = Date.now()
@@ -5126,7 +5408,7 @@ export class AgentGateway {
       // Mistyped share_file tokens are repaired the same way.
       if (previewPublicUrl || shareLinkTokens.size > 0) {
         const rewriteText = (text: string) =>
-          repairShareLinks(rewriteLocalhostLinks(text, previewPublicUrl), shareLinkTokens)
+          repairShareLinks(rewriteLocalhostLinks(text, previewPublicUrl, { ownPorts }), shareLinkTokens)
         const rewriteMessage = (msg: Message) => {
           if (msg.role !== 'assistant' || !Array.isArray(msg.content)) return
           for (const block of msg.content as any[]) {
@@ -5384,7 +5666,6 @@ export class AgentGateway {
       // leaves one behind for the boot sweep.
       if (tracksInflightTurn) {
         this.sessionManager.setSessionMetadata(sessionId, { inflightTurn: null })
-        this.resumeStarts.delete(sessionId)
       }
       if (this.retryWakers.get(sessionId) === retryWaker) this.retryWakers.delete(sessionId)
       if (typingInterval) clearInterval(typingInterval)
@@ -7507,12 +7788,37 @@ export class AgentGateway {
   private turnAbortControllers = new Map<string, AbortController>()
 
   /**
-   * Sessions whose next turn is a boot-sweep resume (SHO-121), mapped to the
-   * attempt number its in-flight marker should carry. Without this a resume
-   * that also dies would look like a fresh interruption on the next boot and
-   * resume forever.
+   * Automatic restarts this session has used since a person last wrote, read
+   * off the session's persisted metadata (`autoResumesSinceHuman`).
+   *
+   * It used to be an in-memory map the turn's `finally` deleted, which meant
+   * every completed resume reset the cap: resume → turn ends → watch wakes the
+   * session → pod dies → `resumeAttempts: 0` → resume again, for days (SHO-227).
+   * Persisted, it survives the turn and the boot sweep, and only a person's
+   * message clears it.
    */
-  private resumeStarts = new Map<string, number>()
+  private autoResumesSinceHuman(sessionId: string): number {
+    const value = this.sessionManager.get(sessionId)?.metadata?.autoResumesSinceHuman
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+  }
+
+  /**
+   * Record what started this turn, so the next boot knows whether this session
+   * has spent its one automatic restart. A resume counts; a person's message
+   * clears the count; a task wake or a heartbeat leaves it alone (neither is a
+   * person, and neither is a restart).
+   */
+  private noteTurnOrigin(sessionId: string, origin: TurnOrigin): void {
+    if (origin === 'resume') {
+      this.sessionManager.setSessionMetadata(sessionId, {
+        autoResumesSinceHuman: this.autoResumesSinceHuman(sessionId) + 1,
+      })
+      return
+    }
+    if (origin === 'person' && this.autoResumesSinceHuman(sessionId) !== 0) {
+      this.sessionManager.setSessionMetadata(sessionId, { autoResumesSinceHuman: 0 })
+    }
+  }
 
   /** Per-session turn lock: ensures sequential turn execution so a "continue"
    *  after stop always sees the interrupted turn's messages in the session.
